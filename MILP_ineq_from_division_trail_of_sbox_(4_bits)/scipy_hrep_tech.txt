@@ -1,0 +1,189 @@
+================================================================================
+HOW SCIPY COMPUTES THE H-REPRESENTATION (CONVEX HULL INEQUALITIES)
+A Stage-by-Stage Technical Guide with a 10-Point Example
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+SciPy's `scipy.spatial.ConvexHull` uses the Qhull C-library to implement the
+Quickhull algorithm in arbitrary dimensions d. 
+
+While SciPy calculates the boundary hyperplanes, its raw output `hull.equations`
+presents two challenges for Mixed-Integer Linear Programming (MILP):
+  (1) Coefficients are floating-point numbers normalized to unit Euclidean length.
+  (2) Coplanar facets are triangulated into multiple identical hyperplanes.
+
+This document walks through the exact 5-stage mathematical and algorithmic
+pipeline used to transform raw points into exact integer MILP inequalities.
+
+
+2. STAGE 1: THE INPUT DATASET (10 Points in 2D)
+--------------------------------------------------------------------------------
+Consider the following 10 points in R^2:
+
+  Index   Coordinates   Role in Geometry
+  --------------------------------------------------------
+  P0      [0, 0]        Boundary corner
+  P1      [2, 0]        Collinear point on bottom edge (between P0 and P2)
+  P2      [4, 0]        Boundary corner
+  P3      [4, 3]        Boundary corner
+  P4      [2, 4]        Boundary top peak
+  P5      [0, 3]        Boundary corner
+  P6      [1, 1]        Interior point (strictly inside)
+  P7      [2, 1]        Interior point (strictly inside)
+  P8      [3, 1]        Interior point (strictly inside)
+  P9      [2, 2]        Interior point (strictly inside)
+
+ASCII Visualization:
+       y ^
+         |         P4(2,4)
+       4 |         /     \
+       3 |    P5(0,3)    P3(4,3)
+       2 |       |  P9(2,2) |
+       1 |    P6(1,1) P7 P8 |
+       0 +----P0(0,0)-P1(2,0)-P2(4,0)-----> x
+         0    1    2    3    4
+
+
+3. STAGE 2: QUICKHULL GEOMETRIC COMPUTATION
+--------------------------------------------------------------------------------
+When `ConvexHull(points)` is invoked, Qhull executes three geometric steps:
+
+Step 2.1: Extreme Points Selection
+  It finds initial extreme coordinates (e.g., min/max in x and y: P0, P2, P4)
+  to form an initial bounding simplex.
+
+Step 2.2: Elimination of Interior Points
+  Points P6, P7, P8, P9 fall strictly inside the simplex. They cannot form
+  outer boundary faces and are eliminated from facet generation.
+  Point P1(2, 0) lies on the segment connecting P0 and P2 and is collinear.
+
+Step 2.3: Facet Normal & Offset Calculation
+  For every boundary facet connecting vertices, Qhull solves for the outward
+  normal vector.
+  
+  Example: The slanted top-right edge connecting P4(2, 4) and P3(4, 3):
+    - Edge direction vector:
+        v = P3 - P4 = (4 - 2, 3 - 4) = (2, -1)
+    - Outward normal vector n = (nx, ny) must be orthogonal to v:
+        n · v = 0  =>  2*nx - 1*ny = 0  =>  n is parallel to (1, 2)
+    - Qhull enforces unit Euclidean length (||n||_2 = 1):
+        ||n||_2 = sqrt(1^2 + 2^2) = sqrt(5) ≈ 2.236068
+        nx = 1 / sqrt(5) ≈ 0.447214
+        ny = 2 / sqrt(5) ≈ 0.894427
+    - Offset c is calculated using the point on the facet:
+        c = -(n · P4) = - ( (1/sqrt(5))*2 + (2/sqrt(5))*4 )
+          = - 10 / sqrt(5) = -2 * sqrt(5) ≈ -4.472136
+
+
+4. STAGE 3: RAW SCIPY OUTPUT (hull.equations)
+--------------------------------------------------------------------------------
+SciPy represents facet inequalities in the convention:
+    nx * x + ny * y + c <= 0
+
+For this 10-point dataset, `hull.equations` produces 5 rows:
+
+  Row   nx           ny           c            Mathematical Meaning
+  --------------------------------------------------------------------------
+  1     -1.000000    0.000000     0.000000     -1.0*x + 0 <= 0  =>  x >= 0
+  2      0.000000   -1.000000     0.000000     -1.0*y + 0 <= 0  =>  y >= 0
+  3      1.000000    0.000000    -4.000000      1.0*x - 4 <= 0  =>  x <= 4
+  4      0.447214    0.894427    -4.472136      0.447x + 0.894y - 4.472 <= 0
+  5     -0.447214    0.894427    -2.683282     -0.447x + 0.894y - 2.683 <= 0
+
+
+5. STAGE 4: COPRIME INTEGER RECONSTRUCTION
+--------------------------------------------------------------------------------
+In MILP models, inequalities must use exact coprime integers:
+    A * x + b >= 0
+
+Our integer reconstruction algorithm processes each row through 4 steps:
+
+Example with Row 4: [0.447214, 0.894427, -4.472136]
+
+  Step 4.1: Sign Inversion
+    Convert from '<= 0' to '>= 0' by negating the vector:
+      r = - [0.447214, 0.894427, -4.472136]
+        = [-0.447214, -0.894427, 4.472136]
+
+  Step 4.2: Normalize by Smallest Non-Zero Component
+    Find m = min(|r_j|) = 0.447214. Divide all elements by m:
+      scaled = r / 0.447214
+             = [-1.000000, -2.000000, 10.000000]
+
+  Step 4.3: Integer Multiplier Search
+    Search for the smallest integer d in {1, 2, ..., 100} such that (d * scaled)
+    is within tolerance 1e-4 of an integer vector.
+    Here for d = 1:
+      ints = [-1, -2, 10]
+
+  Step 4.4: GCD Reduction
+    Divide all coefficients by their greatest common divisor:
+      g = gcd(|-1|, |-2|, |10|) = 1
+      result = (-1, -2, 10)
+
+
+6. STAGE 5: FINAL ALGEBRAIC H-REPRESENTATION
+--------------------------------------------------------------------------------
+The resulting system of inequalities describing the convex hull is:
+
+  Constraint 1:  x >= 0
+  Constraint 2:  y >= 0
+  Constraint 3:  -x + 4 >= 0            (equivalent to: x <= 4)
+  Constraint 4:  -x - 2y + 10 >= 0      (equivalent to: x + 2y <= 10)
+  Constraint 5:  x - 2y + 6 >= 0        (equivalent to: 2y - x <= 6)
+
+Every one of the original 10 points satisfies all 5 constraints simultaneously.
+Any point outside the polygon violates at least one constraint.
+
+
+7. COMPARISON: 2D EXAMPLE vs. 8D DIVISION TRAILS (PRESENT S-BOX)
+--------------------------------------------------------------------------------
+The exact same algorithm scales to arbitrary dimensions:
+
+  Property                2D Example               8D Division Trails
+  ------------------------------------------------------------------------------
+  Dimension (d)           2 (x, y)                 8 (a3, a2, a1, a0, b3, b2, b1, b0)
+  Input Points            10 points                47 division trails
+  Facet Geometric Object  1D lines                 7D hyperplanes
+  Points per Simplex      2 vertices               8 vertices
+  Raw Qhull Facets        5                        7,062 triangulated simplices
+  Unique Facet H-Rep      5 unique inequalities    122 unique inequalities
+  After Algorithm 1       5 minimal constraints    10 minimal constraints
+
+
+8. PYTHON VERIFICATION SCRIPT
+--------------------------------------------------------------------------------
+The following standalone script reproduces this exact computation:
+
+```python
+import numpy as np
+from scipy.spatial import ConvexHull
+import math
+
+pts = np.array([
+    [0, 0], [2, 0], [4, 0], [4, 3], [2, 4],
+    [0, 3], [1, 1], [2, 1], [3, 1], [2, 2]
+], dtype=float)
+
+hull = ConvexHull(pts)
+unique_ineqs = set()
+
+for eq in hull.equations:
+    r = -eq
+    nz = [abs(x) for x in r if abs(x) > 1e-5]
+    if not nz:
+        continue
+    scaled = r / min(nz)
+    for d in range(1, 100):
+        test = scaled * d
+        if np.max(np.abs(test - np.round(test))) < 1e-4:
+            ints = np.round(test).astype(int)
+            g = math.gcd(math.gcd(abs(ints[0]), abs(ints[1])), abs(ints[2]))
+            unique_ineqs.add(tuple(ints // g))
+            break
+
+for ineq in sorted(list(unique_ineqs)):
+    print(f"{ineq[0]}*x + {ineq[1]}*y + {ineq[2]} >= 0")
+```
+================================================================================
